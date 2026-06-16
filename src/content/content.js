@@ -24,6 +24,7 @@ import { createSessionController, RECORDING_STATUS } from "./session-controller.
 // reference it here for transport — we do not define it.
 import { createMessageChannel, MessageType } from "./message-channel.js";
 import { resolveElement } from "./shadow-resolver.js";
+import { captureElement } from "./capture.js";
 
 // Re-export the overlay surface so consumers/tests can reach it via the entry.
 export { OverlayUIHost, OVERLAY_CONTAINER_ID, ROOT_STYLE_RESET } from "./overlay-ui.js";
@@ -84,13 +85,29 @@ export function createContentApp(options = {}) {
   let panel = null;
 
   /**
-   * Forward the frozen Interaction_Timeline to the Service_Worker (Req 11.6):
-   * a TIMELINE_CHUNK over the Port followed by a SESSION_STOP command. Best
-   * effort — transport failures never disrupt teardown.
+   * Snapshot of the locked Target_Element (markup, computed styles, declared
+   * animations, Figma tokens) captured on lock. This is the real payload the
+   * Service_Worker analyzes — without it the report comes back empty.
+   * @type {{ html: string, css: string, computed: object, animations: object[], figmaTokens: object[] } | null}
+   */
+  let captured = null;
+
+  /**
+   * Forward the frozen Interaction_Timeline plus the captured element context
+   * to the Service_Worker (Req 11.6): a TIMELINE_CHUNK carrying the timeline,
+   * computed styles, animation descriptors, code tabs, and Figma tokens, then a
+   * SESSION_STOP command. Best effort — transport failures never disrupt teardown.
    */
   function sendFrozenTimeline(timeline, sid) {
     try {
-      channel.streamChunk(MessageType.TIMELINE_CHUNK, { timeline });
+      const chunk = { timeline };
+      if (captured) {
+        chunk.computed = captured.computed;
+        chunk.animations = captured.animations;
+        chunk.codeTabs = { html: captured.html, css: captured.css };
+        chunk.figmaTokens = captured.figmaTokens;
+      }
+      channel.streamChunk(MessageType.TIMELINE_CHUNK, chunk);
       channel.sendCommand(MessageType.SESSION_STOP, { sessionId: sid }).catch(() => {});
     } catch (_transportError) {
       // Messaging is best-effort during teardown; ignore transport errors.
@@ -161,6 +178,13 @@ export function createContentApp(options = {}) {
         return;
       }
       sessionController.lock(target);
+      // Capture the element's markup, computed styles, and declared animations
+      // now that it is locked — this is the data the report is built from.
+      try {
+        captured = captureElement(target);
+      } catch (_captureError) {
+        captured = null;
+      }
       // Selection complete: stop intercepting page clicks so the user can
       // freely trigger the element's animations while we observe its mutations.
       picker.deactivate();
