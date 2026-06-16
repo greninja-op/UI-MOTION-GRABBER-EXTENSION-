@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "name": "Auto-commit to GitHub after each prompt",
+  "description": "After the agent finishes responding to a prompt, stage all changes, commit, and push to the origin remote on the current branch. Skips cleanly when there is nothing to commit.",
+  "version": "1",
+  "when": {
+    "type": "agentStop"
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "git add -A; if (-not (git diff --cached --quiet; $LASTEXITCODE)) { Write-Output \"Nothing to commit.\" } else { git commit -m (\"auto: kiro task checkpoint {0}\" -f (Get-Date -Format \"yyyy-MM-dd HH:mm:ss\")); git push origin (git branch --show-current) }",
+    "timeout": 180
+  }
+}

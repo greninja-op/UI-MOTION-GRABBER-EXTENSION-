@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Popup_UI base sizing. Chromium extension popups have no intrinsic width, so
+   give the root a sensible fixed width and a comfortable max height. */
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  min-width: 420px;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}

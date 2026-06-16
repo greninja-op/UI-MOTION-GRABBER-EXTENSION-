@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Test / tooling caches
+coverage/
+.vitest/
+
+# Logs
+npm-debug.log*
+*.log
+
+# Editor / OS
+.DS_Store
