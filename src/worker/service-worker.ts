@@ -185,6 +185,15 @@ export function installServiceWorker(
    */
   const pending = new Map<string, TimelinePayload>();
 
+  /**
+   * Cache of the most recent completed analysis, so the Popup_UI can fetch the
+   * last capture's results when it is reopened (Chromium closes the popup the
+   * moment the page is clicked, so result pushes can arrive while it is shut).
+   */
+  const latestBySession = new Map<string, AnalysisPipelineResult>();
+  let latestAny: { sessionId: string; result: AnalysisPipelineResult } | null =
+    null;
+
   /** Merge an incoming chunk payload into the session's accumulated payload. */
   function accumulate(sessionId: string, payload: TimelinePayload): void {
     const current = pending.get(sessionId) ?? {};
@@ -240,6 +249,10 @@ export function installServiceWorker(
     send(MessageType.STATE_MAP, sessionId, result.stateMap);
     send(MessageType.EXPORT_PAYLOAD, sessionId, result.exportPayload);
 
+    // Cache the result so a (re)opened Popup_UI can fetch it on demand.
+    latestBySession.set(sessionId, result);
+    latestAny = { sessionId, result };
+
     // The session is finalized; drop its accumulated capture data.
     pending.delete(sessionId);
 
@@ -261,6 +274,24 @@ export function installServiceWorker(
           accumulate(sessionId, stopPayload);
         }
         analyzeSession(sessionId);
+        break;
+      }
+      case MessageType.EXPORT_PAYLOAD: {
+        // A request from the Popup_UI for the latest cached results (sent on
+        // popup open). Re-emit the most recent STATE_MAP + EXPORT_PAYLOAD so the
+        // UI can populate even though the live push may have been missed.
+        const req = (payload ?? {}) as { request?: boolean };
+        if (req.request) {
+          const cached =
+            latestBySession.get(sessionId) ?? latestAny?.result ?? null;
+          const sid = latestBySession.has(sessionId)
+            ? sessionId
+            : latestAny?.sessionId ?? sessionId;
+          if (cached) {
+            send(MessageType.STATE_MAP, sid, cached.stateMap);
+            send(MessageType.EXPORT_PAYLOAD, sid, cached.exportPayload);
+          }
+        }
         break;
       }
       default:

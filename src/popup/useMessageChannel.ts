@@ -156,6 +156,13 @@ export function useMessageChannel(
     };
   }, [channel]);
 
+  // On open, ask the Service_Worker for the most recent cached results so a
+  // reopened popup shows the last capture even if it was closed when the live
+  // push arrived.
+  useEffect(() => {
+    channel.requestLatest();
+  }, [channel]);
+
   const commands = useMemo<SessionCommands>(
     () => ({
       start() {

@@ -115,6 +115,8 @@ export interface PopupMessageChannel {
   freeze(pseudo: FreezePseudoState): void;
   /** Request the Export_Payload as JSON — `EXPORT_PAYLOAD` (Req 6.3). */
   requestExport(payload?: unknown): void;
+  /** Ask the Service_Worker to re-send the latest cached results (on popup open). */
+  requestLatest(): void;
   /** Subscribe to inbound envelopes. Returns an unsubscribe fn (no-op when unavailable). */
   onInbound(handler: InboundHandler): () => void;
   /** Tear down the streaming Port and drop subscribers. */
@@ -339,6 +341,11 @@ export function createPopupMessageChannel(
         request: true,
         ...(payload && typeof payload === "object" ? payload : {}),
       });
+    },
+    requestLatest() {
+      // Pull the most recent cached results from the Service_Worker (the popup
+      // may have been closed when the live push arrived).
+      sendCommand(MessageType.EXPORT_PAYLOAD, { request: true });
     },
     onInbound,
     disconnect,

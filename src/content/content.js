@@ -23,6 +23,7 @@ import { createSessionController, RECORDING_STATUS } from "./session-controller.
 // The Message_Channel client is owned by a sibling module (task 12.1). We only
 // reference it here for transport — we do not define it.
 import { createMessageChannel, MessageType } from "./message-channel.js";
+import { resolveElement } from "./shadow-resolver.js";
 
 // Re-export the overlay surface so consumers/tests can reach it via the entry.
 export { OverlayUIHost, OVERLAY_CONTAINER_ID, ROOT_STYLE_RESET } from "./overlay-ui.js";
@@ -71,8 +72,7 @@ export function createContentApp(options = {}) {
   const sessionId = options.sessionId || generateSessionId();
   const mountOverlay = options.mountOverlay !== false;
 
-  // Message_Channel transport to the Service_Worker (Req 7.6). Defined in the
-  // sibling module; we only consume it here.
+  // Message_Channel transport to the Service_Worker (Req 7.6).
   const channel = createMessageChannel({ chrome: options.chrome, sessionId });
 
   // Capture subsystems.
@@ -80,13 +80,13 @@ export function createContentApp(options = {}) {
   const mutationEngine = createMutationEngine();
   const overlay = new OverlayUIHost();
 
+  /** On-page control panel handle, created on start() and dropped on teardown. */
+  let panel = null;
+
   /**
-   * Forward the frozen Interaction_Timeline to the Service_Worker over the
-   * Message_Channel (Req 11.6). Streamed as a TIMELINE_CHUNK and followed by a
-   * SESSION_STOP command. Transport failures (e.g. no extension context in
-   * tests) are swallowed so teardown is never disrupted.
-   * @param {ReadonlyArray<object>} timeline
-   * @param {string} sid
+   * Forward the frozen Interaction_Timeline to the Service_Worker (Req 11.6):
+   * a TIMELINE_CHUNK over the Port followed by a SESSION_STOP command. Best
+   * effort — transport failures never disrupt teardown.
    */
   function sendFrozenTimeline(timeline, sid) {
     try {
@@ -97,12 +97,48 @@ export function createContentApp(options = {}) {
     }
   }
 
+  /** True when a node belongs to our own injected Overlay_UI (so we ignore it). */
+  function isOverlayNode(node) {
+    if (!node) {
+      return false;
+    }
+    if (
+      overlay.container &&
+      (node === overlay.container ||
+        (typeof overlay.container.contains === "function" &&
+          overlay.container.contains(node)))
+    ) {
+      return true;
+    }
+    return (
+      typeof node.getRootNode === "function" &&
+      Boolean(overlay.shadowRoot) &&
+      node.getRootNode() === overlay.shadowRoot
+    );
+  }
+
+  /** A short, human-readable selector for the locked Target_Element. */
+  function describeTarget(el) {
+    if (!el || !el.tagName) {
+      return "element";
+    }
+    const tag = el.tagName.toLowerCase();
+    const id = el.id ? `#${el.id}` : "";
+    let cls = "";
+    if (typeof el.className === "string" && el.className.trim()) {
+      cls = "." + el.className.trim().split(/\s+/).slice(0, 2).join(".");
+    }
+    return `${tag}${id}${cls}`;
+  }
+
   /**
-   * Notify the Popup_UI of canonical Recording_Status changes (Req 11.7). The
-   * popup derives its Session_Controls_State view-model from this status.
-   * @param {string} status
+   * Notify the Popup_UI of canonical Recording_Status changes (Req 11.7) and
+   * keep the on-page control panel's status in sync.
    */
   function notifyStatus(status) {
+    if (panel) {
+      panel.setStatus(status);
+    }
     try {
       channel.sendCommand(MessageType.TARGET_LOCKED, { status }).catch(() => {});
     } catch (_transportError) {
@@ -110,13 +146,27 @@ export function createContentApp(options = {}) {
     }
   }
 
-  // Picker locks a Target_Element on click, driving Idle -> Recording via the
-  // Session_Controller (forward reference resolved at call time).
+  // Picker locks a Target_Element on click, driving Idle -> Recording.
   const picker = createPicker({
     root: options.root,
     highlighter,
+    // Ignore our own overlay so hovering/clicking the control panel never
+    // resolves to (or locks) the panel itself.
+    resolve: (x, y) => {
+      const el = resolveElement(x, y);
+      return isOverlayNode(el) ? null : el;
+    },
     onTargetLocked: (target) => {
+      if (isOverlayNode(target)) {
+        return;
+      }
       sessionController.lock(target);
+      // Selection complete: stop intercepting page clicks so the user can
+      // freely trigger the element's animations while we observe its mutations.
+      picker.deactivate();
+      if (panel) {
+        panel.setTarget(describeTarget(target));
+      }
     },
   });
 
@@ -131,17 +181,29 @@ export function createContentApp(options = {}) {
   });
 
   /**
-   * Activate Picker_Mode and (optionally) mount the isolated overlay. The
-   * session remains Idle until the user clicks to lock a Target_Element.
+   * Activate Picker_Mode, mount the isolated overlay, and show the on-page
+   * control panel. The session stays Idle until the user clicks an element.
    */
   function start() {
+    if (sessionController.getStatus() !== RECORDING_STATUS.IDLE) {
+      return;
+    }
     if (mountOverlay) {
-      overlay.mount();
+      const shadow = overlay.mount();
+      const doc =
+        overlay.document || (typeof document !== "undefined" ? document : null);
+      if (doc && shadow) {
+        panel = buildControlPanel(doc, shadow, {
+          onPause: () => api.pause(),
+          onResume: () => api.resume(),
+          onStop: () => api.stop(),
+        });
+      }
     }
     picker.activate();
   }
 
-  return {
+  const api = {
     sessionId,
     picker,
     mutationEngine,
@@ -153,10 +215,128 @@ export function createContentApp(options = {}) {
     resume: () => sessionController.resume(),
     stop: () => {
       const status = sessionController.stop();
-      overlay.unmount();
+      if (panel) {
+        panel.finish();
+        const finishedPanel = panel;
+        panel = null;
+        // Leave the "captured" confirmation up briefly, then tear down the UI.
+        setTimeout(() => {
+          overlay.unmount();
+          if (typeof finishedPanel.destroy === "function") {
+            finishedPanel.destroy();
+          }
+        }, 2500);
+      } else {
+        overlay.unmount();
+      }
       return status;
     },
     getStatus: () => sessionController.getStatus(),
+  };
+
+  return api;
+}
+
+/**
+ * Build the on-page control panel inside the Overlay_UI shadow root so a user
+ * can run a full capture (pick → record → stop) without keeping the Popup_UI
+ * open — Chromium closes the popup the moment the page is clicked.
+ *
+ * Renders a small fixed panel with a status line and Pause/Resume/Stop buttons.
+ * All styling is inline within the isolated shadow tree, so it neither pollutes
+ * nor is affected by the host page.
+ *
+ * @param {Document} doc
+ * @param {ShadowRoot} shadowRoot
+ * @param {{ onPause: () => void, onResume: () => void, onStop: () => void }} handlers
+ * @returns {{ setStatus: (s: string) => void, setTarget: (d: string) => void, finish: () => void, destroy: () => void }}
+ */
+function buildControlPanel(doc, shadowRoot, handlers) {
+  const wrap = doc.createElement("div");
+  wrap.setAttribute(
+    "style",
+    [
+      "position:fixed",
+      "right:16px",
+      "bottom:16px",
+      "z-index:2147483647",
+      "pointer-events:auto",
+      "font:13px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif",
+      "color:#0f172a",
+      "background:#ffffff",
+      "border:1px solid #e2e8f0",
+      "border-radius:10px",
+      "box-shadow:0 8px 28px rgba(0,0,0,.20)",
+      "padding:12px 14px",
+      "min-width:230px",
+    ].join(";"),
+  );
+
+  const title = doc.createElement("div");
+  title.textContent = "UI Motion Grabber";
+  title.setAttribute("style", "font-weight:600;margin-bottom:6px");
+
+  const status = doc.createElement("div");
+  status.textContent = "Hover and click an element to capture.";
+  status.setAttribute("style", "margin-bottom:10px;color:#475569");
+
+  const row = doc.createElement("div");
+  row.setAttribute("style", "display:flex;gap:8px");
+
+  const makeButton = (label, bg, fg) => {
+    const button = doc.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    button.setAttribute(
+      "style",
+      `cursor:pointer;border:0;border-radius:6px;padding:6px 12px;font:inherit;background:${bg};color:${fg}`,
+    );
+    return button;
+  };
+
+  const pauseButton = makeButton("Pause", "#e2e8f0", "#0f172a");
+  const resumeButton = makeButton("Resume", "#2563eb", "#ffffff");
+  const stopButton = makeButton("Stop", "#dc2626", "#ffffff");
+  resumeButton.style.display = "none";
+
+  pauseButton.addEventListener("click", () => handlers.onPause && handlers.onPause());
+  resumeButton.addEventListener("click", () => handlers.onResume && handlers.onResume());
+  stopButton.addEventListener("click", () => handlers.onStop && handlers.onStop());
+
+  row.append(pauseButton, resumeButton, stopButton);
+  wrap.append(title, status, row);
+  shadowRoot.appendChild(wrap);
+
+  return {
+    setStatus(next) {
+      if (next === "Recording") {
+        status.textContent = "Recording… interact with the element.";
+        pauseButton.style.display = "";
+        resumeButton.style.display = "none";
+      } else if (next === "Paused") {
+        status.textContent = "Paused.";
+        pauseButton.style.display = "none";
+        resumeButton.style.display = "";
+      } else if (next === "Stopped") {
+        status.textContent = "Captured! Open the popup to view the results.";
+      }
+    },
+    setTarget(description) {
+      status.textContent = `Recording ${description} — interact with it, then Stop.`;
+    },
+    finish() {
+      pauseButton.style.display = "none";
+      resumeButton.style.display = "none";
+      stopButton.textContent = "Done";
+      stopButton.disabled = true;
+      stopButton.style.opacity = "0.6";
+      stopButton.style.cursor = "default";
+    },
+    destroy() {
+      if (typeof wrap.remove === "function") {
+        wrap.remove();
+      }
+    },
   };
 }
 
