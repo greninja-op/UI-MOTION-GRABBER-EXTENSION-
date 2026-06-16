@@ -159,3 +159,63 @@ export function createContentApp(options = {}) {
     getStatus: () => sessionController.getStatus(),
   };
 }
+
+/**
+ * Browser bootstrap. When the Content_Script is injected into a real page
+ * (`chrome.runtime` present), construct a single Recording_Session app and let
+ * the Popup_UI drive it via Message_Channel commands delivered to this tab:
+ *
+ *   PICKER_START                -> start Picker_Mode (mount overlay, activate picker)
+ *   PICKER_START {control:pause}  -> pause the active session
+ *   PICKER_START {control:resume} -> resume a paused session
+ *   SESSION_STOP                -> stop, tear down, and forward the timeline
+ *
+ * Construction is side-effect free; nothing touches the host page until a
+ * PICKER_START arrives, so merely injecting the script never alters the page.
+ * Guarded so importing the module in tests/non-extension contexts is inert.
+ *
+ * @returns {ReturnType<typeof createContentApp> | null}
+ */
+export function bootstrapContentScript() {
+  if (
+    typeof chrome === "undefined" ||
+    !chrome.runtime ||
+    !chrome.runtime.onMessage
+  ) {
+    return null;
+  }
+
+  const app = createContentApp();
+
+  app.channel.onCommand((envelope) => {
+    if (!envelope || typeof envelope !== "object") {
+      return;
+    }
+    switch (envelope.type) {
+      case MessageType.PICKER_START: {
+        const control =
+          envelope.payload && typeof envelope.payload === "object"
+            ? envelope.payload.control
+            : undefined;
+        if (control === "pause") {
+          app.pause();
+        } else if (control === "resume") {
+          app.resume();
+        } else {
+          app.start();
+        }
+        break;
+      }
+      case MessageType.SESSION_STOP:
+        app.stop();
+        break;
+      default:
+        break;
+    }
+  });
+
+  return app;
+}
+
+// Activate the bootstrap when running as an injected Content_Script.
+bootstrapContentScript();

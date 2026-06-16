@@ -65,9 +65,21 @@ export interface PopupChromeRuntime {
   connect?(connectInfo?: { name?: string }): PopupChromePort;
 }
 
+/** A minimal tab record (only the `id` is consumed). */
+export interface PopupChromeTab {
+  id?: number;
+}
+
+/** The narrow `chrome.tabs` surface used to reach the active tab's content script. */
+export interface PopupChromeTabs {
+  query(queryInfo: { active?: boolean; currentWindow?: boolean }): Promise<PopupChromeTab[]>;
+  sendMessage(tabId: number, message: unknown): unknown;
+}
+
 /** The narrow `chrome` surface this client depends on. */
 export interface PopupChromeApi {
   runtime?: PopupChromeRuntime;
+  tabs?: PopupChromeTabs;
 }
 
 /** The `:hover` / `:active` pseudo-states the popup can request a freeze for. */
@@ -184,6 +196,42 @@ export function createPopupMessageChannel(
     runtime.sendMessage(makeEnvelope(type, payload));
   }
 
+  /**
+   * Deliver a command to the Content_Script running in the active tab via
+   * `chrome.tabs.sendMessage`. Picker/session lifecycle commands target the page
+   * (not the Service_Worker), so they are routed to the active tab. Falls back to
+   * `runtime.sendMessage` when the `chrome.tabs` surface is unavailable. Inert
+   * when no messaging context is present.
+   */
+  function sendToActiveTab(type: MessageType, payload?: unknown): void {
+    if (!available) {
+      return;
+    }
+    const envelope = makeEnvelope(type, payload);
+    const tabs = chromeApi?.tabs;
+    if (
+      tabs &&
+      typeof tabs.query === "function" &&
+      typeof tabs.sendMessage === "function"
+    ) {
+      Promise.resolve(tabs.query({ active: true, currentWindow: true }))
+        .then((result) => {
+          const tabId = Array.isArray(result) ? result[0]?.id : undefined;
+          if (typeof tabId === "number") {
+            tabs.sendMessage(tabId, envelope);
+          }
+        })
+        .catch(() => {
+          /* active-tab delivery is best-effort */
+        });
+      return;
+    }
+    // Fallback: route over the runtime channel.
+    if (runtime) {
+      runtime.sendMessage(envelope);
+    }
+  }
+
   /** Fan a valid inbound envelope out to every subscriber. */
   function fanOut(message: unknown): void {
     if (!isMessageEnvelope(message)) {
@@ -266,22 +314,22 @@ export function createPopupMessageChannel(
     makeEnvelope,
     sendCommand,
     start(payload?: unknown) {
-      sendCommand(MessageType.PICKER_START, payload);
+      sendToActiveTab(MessageType.PICKER_START, payload);
     },
     pause(payload?: unknown) {
-      sendCommand(MessageType.PICKER_START, {
+      sendToActiveTab(MessageType.PICKER_START, {
         control: "pause" satisfies RecordingControl,
         ...(payload && typeof payload === "object" ? payload : {}),
       });
     },
     resume(payload?: unknown) {
-      sendCommand(MessageType.PICKER_START, {
+      sendToActiveTab(MessageType.PICKER_START, {
         control: "resume" satisfies RecordingControl,
         ...(payload && typeof payload === "object" ? payload : {}),
       });
     },
     stop(payload?: unknown) {
-      sendCommand(MessageType.SESSION_STOP, payload);
+      sendToActiveTab(MessageType.SESSION_STOP, payload);
     },
     freeze(pseudo: FreezePseudoState) {
       sendCommand(MessageType.FREEZE_PSEUDO, { pseudo });
